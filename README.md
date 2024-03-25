@@ -1,3 +1,6 @@
+### Tests results
+![Screenshot](assets/Screenshot%20from%202024-03-25%2022-04-46.png)
+
 # ben-or-consensus-algorithm
 
 Your goal for this exercise is to implement a version of the Ben Or consensus algorithm
