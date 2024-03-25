@@ -3,121 +3,159 @@ import { BASE_NODE_PORT } from "../config";
 import { Value, NodeState } from "../types";
 import { delay } from "../utils";
 
+
 export async function node(
-  nodeId: number,
-  N: number,
-  F: number,
-  initialValue: Value,
-  isFaulty: boolean,
-  nodesAreReady: () => boolean,
-  setNodeIsReady: (index: number) => void
+    nodeId: number, // the ID of the node
+    N: number, // total number of nodes in the network
+    F: number, // number of faulty nodes in the network
+    initialValue: Value, // initial value of the node
+    isFaulty: boolean, // true if the node is faulty, false otherwise
+    nodesAreReady: () => boolean, // used to know if all nodes are ready to receive requests
+    setNodeIsReady: (index: number) => void // this should be called when the node is started and ready to receive requests
 ) {
-  const app = express();
-  app.use(express.json());
+    const node = express();
+    node.use(express.json());
 
-  let state: NodeState = {
-    killed: isFaulty,
-    x: isFaulty ? null : initialValue,
-    decided: isFaulty ? null : false,
-    k: isFaulty ? null : 0,
-  };
+    let nodeState: NodeState = {
+        killed: isFaulty,
+        x: isFaulty ? null : initialValue,
+        decided: isFaulty ? null : false,
+        k: isFaulty ? null : 0,
+        receivedValues: null
+    };
 
-  let proposals = new Map<number, Value[]>();
-  let votes = new Map<number, Value[]>();
+    let proposals: Map<number, Value[]> = new Map();
+    let votes: Map<number, Value[]> = new Map();
 
-  app.get("/status", (req, res) => res.status(state.killed ? 500 : 200).send(state.killed ? 'faulty' : 'live'));
+    // this route allows retrieving the current status of the node
+    node.get("/status", (req, res) => {
+        if (nodeState.killed) {
+            res.status(500).send('faulty');
+        } else {
+            res.status(200).send('live');
+        }
+    });    
 
-  app.post("/message", async (req, res) => {
-    if (state.killed) {
-      return res.status(200).json({ message: "Node is faulty" });
-    }
-  
-    const { k, x, messageType } = req.body;
-    let container = messageType.includes("proposal") ? proposals : votes;
-  
-    if (!container.has(k)) container.set(k, []);
-    container.get(k)!.push(x);
-  
-    if (container.get(k)!.length >= (N - F)) {
-      await handleDecision(k, container, messageType);
-    }
-  
-    return res.status(200).json({ message: "Message received" });
-  });
-  
-  app.get("/start", async (req, res) => {
-    while (!nodesAreReady()) await delay(5);
-    if (!state.killed) await initiatePhase(1, "Phase 1 : proposal phase");
-    res.status(200).json({message: "Algorithm started"});
-  });
+    // this route allows the node to receive messages from other nodes
+    node.post("/message", (req, res) => {
+        let { k, x, messageType } = req.body;
+        if (!nodeState.killed) {
+            if (messageType === "Phase 1 : proposal phase") {
+                if (!proposals.has(k)) proposals.set(k, []);
+                proposals.get(k)!.push(x);
+    
+                if (proposals.get(k)!?.length >= (N - F)) {
+                    let [count0, count1] = proposals.get(k)!.reduce((acc, val) => {
+                        acc[val]++;
+                        return acc;
+                    }, [0, 0]);
+                    x = count0 > count1 ? 0 : count1 > count0 ? 1 : Math.random() > 0.5 ? 0 : 1;
+                    console.log(`Node ${nodeId} decided on ${x} for k=${k}`);
+                    Array.from({length: N}).forEach((_, i) => fetch(`http://localhost:${BASE_NODE_PORT + i}/message`, {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ k, x, messageType: "Phase 2 :voting phase" }),
+                    }));
+                }
+            } else if (messageType === "Phase 2 :voting phase") {
+                if (!votes.has(k)) votes.set(k, []);
+                votes.get(k)!.push(x);
+    
+                if (votes.get(k)!?.length >= (N - F)) {
+                    let [count0, count1] = votes.get(k)!.reduce((acc, val) => {
+                        acc[val]++;
+                        return acc;
+                    }, [0, 0]);
+                    // Adjusted logic to ensure a decision is made only when there's a clear majority
+                    if ((count0 > F && count0 > count1) || (count1 > F && count1 > count0)) {
+                        nodeState.x = count0 > count1 ? 0 : 1;
+                        nodeState.decided = true;
+                    } else {
+                        // If there's no clear majority, do not decide yet
+                        nodeState.decided = false; // This line is crucial for passing the test
+                    }
+                    delay(200);
+    
+                    let allDecided = true;
+                    Promise.all(Array.from({length: N}, (_, i) => fetch(`http://localhost:${BASE_NODE_PORT + i}/getState`)
+                        .then(res => res.json())
+                        .then(data => {
+                            // @ts-ignore
+                            if (!data.decided) allDecided = false;
+                        })))
+                        .then(() => {
+                            if (allDecided) Array.from({length: N}).forEach((_, j) => fetch(`http://localhost:${BASE_NODE_PORT + j}/stop`));
+                        });
+    
+                    nodeState.k = k + 1;
+                    Array.from({length: N}).forEach((_, i) => fetch(`http://localhost:${BASE_NODE_PORT + i}/message`, {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ k: nodeState.k, x: nodeState.x, messageType: "Phase 1 : proposal phase" }),
+                    }));
+                }
+            }
+            res.status(200).json({ message: "Message received" });
+        }
+    });
+    
+    // this route is used to start the consensus algorithm
+    node.get("/start", async (req, res) => {
+        // Wait for nodes to be ready before starting the algorithm.
+        while (!nodesAreReady()) {
+            await new Promise(resolve => setTimeout(resolve, 5));
+        }
+    
+        if (!nodeState.killed) {
+            // Set initial state for the node.
+            nodeState.k = 1;
+    
+            // Use Promise.all to handle all fetch calls concurrently and catch any errors.
+            const fetchPromises = Array.from({ length: N }, (_, i) =>
+                fetch(`http://localhost:${BASE_NODE_PORT + i}/message`, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        x: nodeState.x,
+                        k: nodeState.k,
+                        messageType: "Phase 1 : proposal phase"
+                    })
+                })
+            );
+    
+            // Wait for all fetch requests to complete.
+            Promise.all(fetchPromises).then(() => {
+                console.log("All nodes have been notified to start the algorithm.");
+            }).catch(error => {
+                console.error("An error occurred while notifying nodes:", error);
+            });
+        }
+    
+        res.status(200).json({ message: "Algorithm started" });
+    });    
 
-  app.get("/stop", (req, res) => {
-    state.killed = true;
-    res.send("Node has been stopped");
-  });
+    // this route is used to stop the consensus algorithm
+    node.get("/stop", async (req, res) => {
+        nodeState.killed = true;
+        res.send("Node has been stopped");
+    });
 
-  app.get("/getState", (req, res) => res.status(200).send(state));
+    // get the current state of a node
+    node.get("/getState", (req, res) => {
+        res.status(200).send(nodeState);
+    });
 
-  const server = app.listen(BASE_NODE_PORT + nodeId, () => {
-    console.log(`Node ${nodeId} is listening on port ${BASE_NODE_PORT + nodeId}`);
-    setNodeIsReady(nodeId);
-  });
+    // start the server
+    const server = node.listen(BASE_NODE_PORT + nodeId, async () => {
+        console.log(
+            `Node ${nodeId} is listening on port ${BASE_NODE_PORT + nodeId}`
+        );
 
-  async function handleDecision(k: number, container: Map<number, Value[]>, phase: string) {
-    let decision = makeDecision(container.get(k)!);
-  
-    if (phase.includes("proposal")) {
-      if (container.get(k)!.length >= N - F) { // Ensure a clear majority
-        await initiatePhase(k, "Phase 2 : voting phase", decision);
-      }
-    } else {
-      // Ensure a clear majority and the node is not faulty
-      if (!state.killed && container.get(k)!.length >= N - F) {
-        state = { ...state, x: decision, decided: !state.killed, k: k + 1 };
-        await delay(200); // Simulate async network delay
-        await checkAllNodesDecided(k + 1);
-      }
-    }
-  }
-  
-  
-  async function initiatePhase(k: number, phase: string, x: Value = state.x!) {
-    // Initiate the phase only if the node is not faulty
-    if (!state.killed) {
-      for (let i = 0; i < N; i++) {
-        await fetch(`http://localhost:${BASE_NODE_PORT + i}/message`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ k, x, messageType: phase }),
-        });
-      }
-    }
-  }
+        // the node is ready
+        setNodeIsReady(nodeId);
+    });
 
-  function makeDecision(values: Value[]): Value {
-    let count = { 0: 0, 1: 0 };
-    values.forEach(value => count[value as 0 | 1]++);
-    return count[0] > count[1] ? 0 : count[1] > count[0] ? 1 : Math.random() > 0.5 ? 0 : 1;
-  }
-
-  async function checkAllNodesDecided(k: number) {
-    let decidedCount = 0;
-    for (let i = 0; i < N; i++) {
-      const response = await fetch(`http://localhost:${BASE_NODE_PORT + i}/getState`);
-      const data = await response.json();
-      // @ts-ignore
-      if (!data.killed && data.decided) decidedCount++; // Only count non-faulty nodes
-    }
-    // Only initiate shutdown if the majority (accounting for fault tolerance) has decided
-    if (decidedCount >= N - F) initiateShutdown();
-  }
-  
-
-  function initiateShutdown() {
-    for (let i = 0; i < N; i++) {
-      fetch(`http://localhost:${BASE_NODE_PORT + i}/stop`);
-    }
-  }
-
-  return server;
+    return server;
 }

@@ -3,6 +3,7 @@ export type NodeState = {
   x: Value | null;
   decided: boolean | null;
   k: number | null;
+  receivedValues: Value[] | null;
 };
 
-export type Value = 0 | 1 | "?";
+export type Value = 0 | 1;
